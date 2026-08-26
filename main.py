@@ -104,7 +104,53 @@ def get_dashboard():
     mouse_rows = cursor.fetchall()
     conn.close()
 
-    def round_to_15m(ts_str):
+    # 1. Agrupar Teclado primeiro ao MINUTO
+    minute_kb = {}
+    for ts, total, corr in kb_rows:
+        try:
+            dt = datetime.fromisoformat(ts)
+            min_key = dt.strftime("%Y-%m-%d %H:%M")
+            if min_key not in minute_kb:
+                minute_kb[min_key] = {"keys": 0, "corr": 0, "active_5s_blocks": 0}
+            minute_kb[min_key]["keys"] += total
+            minute_kb[min_key]["corr"] += corr
+            if total > 0:
+                minute_kb[min_key]["active_5s_blocks"] += 1
+        except:
+            pass
+
+    # Calcular a velocidade normalizada por minuto (Teclas/Minuto)
+    normalized_minutes = {}
+    for min_key, data in minute_kb.items():
+        n = data["active_5s_blocks"]
+        if n > 0:
+            # Extrapolação baseada nos blocos de 5s ativos (fator 12 / N)
+            keys_per_min = data["keys"] * (12.0 / n)
+            error_rate = (data["corr"] / data["keys"]) * 100.0 if data["keys"] > 0 else 0.0
+            normalized_minutes[min_key] = {
+                "keys_per_min": keys_per_min,
+                "error_rate": error_rate
+            }
+
+    # 2. Agrupar em Blocos de 15 Minutos
+    def get_15m_block(ts_str):
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+            b_min = (dt.minute // 15) * 15
+            return dt.strftime(f"%H:{b_min:02d}")
+        except:
+            return "N/A"
+
+    kb_15m_buckets = {}
+    for min_key, norm_data in normalized_minutes.items():
+        b = get_15m_block(min_key)
+        if b not in kb_15m_buckets:
+            kb_15m_buckets[b] = {"speeds": [], "error_rates": []}
+        kb_15m_buckets[b]["speeds"].append(norm_data["keys_per_min"])
+        kb_15m_buckets[b]["error_rates"].append(norm_data["error_rate"])
+
+    # Agregação Rato em blocos de 15m
+    def round_to_15m_mouse(ts_str):
         try:
             dt = datetime.fromisoformat(ts_str)
             minute = (dt.minute // 15) * 15
@@ -112,39 +158,41 @@ def get_dashboard():
         except:
             return "N/A"
 
-    kb_buckets = {}
-    for ts, total, corr in kb_rows:
-        b = round_to_15m(ts)
-        if b not in kb_buckets:
-            kb_buckets[b] = {"keys": 0, "corr": 0, "active_samples": 0}
-        kb_buckets[b]["keys"] += total
-        kb_buckets[b]["corr"] += corr
-        if total > 0:
-            kb_buckets[b]["active_samples"] += 1
-
     mouse_buckets = {}
     for ts, speed, ratio in mouse_rows:
-        b = round_to_15m(ts)
+        b = round_to_15m_mouse(ts)
         if b not in mouse_buckets:
             mouse_buckets[b] = {"speed_sum": 0.0, "ratio_sum": 0.0, "count": 0}
         mouse_buckets[b]["speed_sum"] += speed
         mouse_buckets[b]["ratio_sum"] += ratio
         mouse_buckets[b]["count"] += 1
 
-    all_buckets = sorted(list(set(list(kb_buckets.keys()) + list(mouse_buckets.keys()))))
+    all_buckets = sorted(list(set(list(kb_15m_buckets.keys()) + list(mouse_buckets.keys()))))
     
-    # Métricas Teclado
-    kb_keys_data = [kb_buckets.get(b, {}).get("keys", 0) for b in all_buckets]
-    kb_error_rate = []
-    for b in all_buckets:
-        tot = kb_buckets.get(b, {}).get("keys", 0)
-        corr = kb_buckets.get(b, {}).get("corr", 0)
-        rate = round((corr / tot) * 100, 1) if tot > 0 else 0.0
-        kb_error_rate.append(rate)
+    # Médias Finais por Bloco de 15 Minutos
+    kb_speed_data = [
+        round(sum(kb_15m_buckets[b]["speeds"]) / len(kb_15m_buckets[b]["speeds"]), 1)
+        if b in kb_15m_buckets and kb_15m_buckets[b]["speeds"] else 0
+        for b in all_buckets
+    ]
+    
+    kb_error_rate_data = [
+        round(sum(kb_15m_buckets[b]["error_rates"]) / len(kb_15m_buckets[b]["error_rates"]), 1)
+        if b in kb_15m_buckets and kb_15m_buckets[b]["error_rates"] else 0
+        for b in all_buckets
+    ]
 
-    # Métricas Rato
-    mouse_speed_data = [round(mouse_buckets[b]["speed_sum"] / mouse_buckets[b]["count"], 1) if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0 for b in all_buckets]
-    mouse_ratio_data = [round((mouse_buckets[b]["ratio_sum"] / mouse_buckets[b]["count"]) * 100, 1) if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0 for b in all_buckets]
+    mouse_speed_data = [
+        round(mouse_buckets[b]["speed_sum"] / mouse_buckets[b]["count"], 1)
+        if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0
+        for b in all_buckets
+    ]
+    
+    mouse_ratio_data = [
+        round((mouse_buckets[b]["ratio_sum"] / mouse_buckets[b]["count"]) * 100, 1)
+        if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0
+        for b in all_buckets
+    ]
 
     html_content = f"""
     <!DOCTYPE html>
@@ -169,19 +217,19 @@ def get_dashboard():
         <div class="container">
             <div class="header">
                 <h1>MindSync - Painel de Telemetria de Foco</h1>
-                <p>Métricas agregadas em intervalos de 15 minutos</p>
+                <p>Médias Normalizadas em Intervalos de 15 Minutos</p>
             </div>
             
             <div class="grid">
-                <!-- Gráfico 1: Volume de Teclas -->
+                <!-- Gráfico 1: Velocidade de Escrita (Média Teclas/Min) -->
                 <div class="card">
-                    <h3>Volume de Digitação (Total Teclas)</h3>
+                    <h3>Velocidade Média de Digitação (Teclas / Min)</h3>
                     <canvas id="keysChart" height="130"></canvas>
                 </div>
 
-                <!-- Gráfico 2: Taxa de Erro -->
+                <!-- Gráfico 2: Taxa de Erro Média -->
                 <div class="card">
-                    <h3>Taxa de Erro / Correções (%)</h3>
+                    <h3>Taxa de Erro Média (%)</h3>
                     <canvas id="errorChart" height="130"></canvas>
                 </div>
 
@@ -201,14 +249,14 @@ def get_dashboard():
 
         <script>
             const labels = {all_buckets};
-            const barConfig = {{ maxBarThickness: 18, borderRadius: 4 }};
+            const barConfig = {{ maxBarThickness: 22, borderRadius: 4 }};
 
-            // 1. Teclas
+            // 1. Teclas / Minuto
             new Chart(document.getElementById('keysChart'), {{
                 type: 'bar',
                 data: {{
                     labels: labels,
-                    datasets: [{{ label: 'Teclas', data: {kb_keys_data}, backgroundColor: '#0284c7', ...barConfig }}]
+                    datasets: [{{ label: 'Teclas/Min', data: {kb_speed_data}, backgroundColor: '#0ea5e9', ...barConfig }}]
                 }},
                 options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
             }});
@@ -218,7 +266,7 @@ def get_dashboard():
                 type: 'bar',
                 data: {{
                     labels: labels,
-                    datasets: [{{ label: 'Taxa Erro (%)', data: {kb_error_rate}, backgroundColor: '#ef4444', ...barConfig }}]
+                    datasets: [{{ label: 'Taxa Erro (%)', data: {kb_error_rate_data}, backgroundColor: '#ef4444', ...barConfig }}]
                 }},
                 options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true, max: 100 }} }} }}
             }});
