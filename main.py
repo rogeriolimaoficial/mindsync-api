@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List
 import sqlite3
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 app = FastAPI(title="MindSync Central API")
 
@@ -67,7 +67,6 @@ def read_root():
 def receive_telemetry(payload: TelemetryPayload):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     for kb in payload.keyboard_events:
         cursor.execute("""
             INSERT INTO keyboard_logs (user_id, timestamp, duration_s, total_keys, correction_keys)
@@ -82,7 +81,7 @@ def receive_telemetry(payload: TelemetryPayload):
         
     conn.commit()
     conn.close()
-    return {"status": "success", "kb_events": len(payload.keyboard_events), "mouse_events": len(payload.mouse_events)}
+    return {"status": "success"}
 
 @app.get("/api/debug-status")
 def debug_status():
@@ -99,17 +98,12 @@ def debug_status():
 def get_dashboard():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    # Busca dados de teclado
     cursor.execute("SELECT timestamp, total_keys, correction_keys FROM keyboard_logs ORDER BY id ASC")
     kb_rows = cursor.fetchall()
-    
-    # Busca dados de rato
     cursor.execute("SELECT timestamp, speed_px_s, straightness_ratio FROM mouse_logs ORDER BY id ASC")
     mouse_rows = cursor.fetchall()
     conn.close()
 
-    # Função auxiliar para arredondar timestamps para blocos de 15 minutos
     def round_to_15m(ts_str):
         try:
             dt = datetime.fromisoformat(ts_str)
@@ -118,33 +112,38 @@ def get_dashboard():
         except:
             return "N/A"
 
-    # Agregação Teclado em blocos de 15m
     kb_buckets = {}
     for ts, total, corr in kb_rows:
-        bucket = round_to_15m(ts)
-        if bucket not in kb_buckets:
-            kb_buckets[bucket] = {"keys": 0, "corr": 0, "samples": 0}
-        kb_buckets[bucket]["keys"] += total
-        kb_buckets[bucket]["corr"] += corr
-        kb_buckets[bucket]["samples"] += 1
+        b = round_to_15m(ts)
+        if b not in kb_buckets:
+            kb_buckets[b] = {"keys": 0, "corr": 0, "active_samples": 0}
+        kb_buckets[b]["keys"] += total
+        kb_buckets[b]["corr"] += corr
+        if total > 0:
+            kb_buckets[b]["active_samples"] += 1
 
-    # Agregação Rato em blocos de 15m
     mouse_buckets = {}
     for ts, speed, ratio in mouse_rows:
-        bucket = round_to_15m(ts)
-        if bucket not in mouse_buckets:
-            mouse_buckets[bucket] = {"speed_sum": 0.0, "ratio_sum": 0.0, "count": 0}
-        mouse_buckets[bucket]["speed_sum"] += speed
-        mouse_buckets[bucket]["ratio_sum"] += ratio
-        mouse_buckets[bucket]["count"] += 1
+        b = round_to_15m(ts)
+        if b not in mouse_buckets:
+            mouse_buckets[b] = {"speed_sum": 0.0, "ratio_sum": 0.0, "count": 0}
+        mouse_buckets[b]["speed_sum"] += speed
+        mouse_buckets[b]["ratio_sum"] += ratio
+        mouse_buckets[b]["count"] += 1
 
     all_buckets = sorted(list(set(list(kb_buckets.keys()) + list(mouse_buckets.keys()))))
     
-    kb_labels = all_buckets
+    # Métricas Teclado
     kb_keys_data = [kb_buckets.get(b, {}).get("keys", 0) for b in all_buckets]
-    kb_corr_data = [kb_buckets.get(b, {}).get("corr", 0) for b in all_buckets]
-    
-    mouse_speed_data = [round(mouse_buckets[b]["speed_sum"] / mouse_buckets[b]["count"], 2) if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0 for b in all_buckets]
+    kb_error_rate = []
+    for b in all_buckets:
+        tot = kb_buckets.get(b, {}).get("keys", 0)
+        corr = kb_buckets.get(b, {}).get("corr", 0)
+        rate = round((corr / tot) * 100, 1) if tot > 0 else 0.0
+        kb_error_rate.append(rate)
+
+    # Métricas Rato
+    mouse_speed_data = [round(mouse_buckets[b]["speed_sum"] / mouse_buckets[b]["count"], 1) if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0 for b in all_buckets]
     mouse_ratio_data = [round((mouse_buckets[b]["ratio_sum"] / mouse_buckets[b]["count"]) * 100, 1) if b in mouse_buckets and mouse_buckets[b]["count"] > 0 else 0 for b in all_buckets]
 
     html_content = f"""
@@ -152,55 +151,96 @@ def get_dashboard():
     <html lang="pt">
     <head>
         <meta charset="UTF-8">
-        <title>MindSync Dashboard - Blocos de 15 Minutos</title>
+        <title>MindSync Analytics</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f8fafc; padding: 25px; }}
-            .container {{ max-width: 1000px; margin: 0 auto; }}
-            .card {{ background: #161f30; padding: 25px; border-radius: 12px; margin-bottom: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); }}
-            h1 {{ text-align: center; color: #38bdf8; font-size: 26px; }}
-            .sub {{ text-align: center; color: #94a3b8; font-size: 14px; margin-top: -10px; margin-bottom: 25px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f8fafc; padding: 30px 20px; }}
+            .container {{ max-width: 1100px; margin: 0 auto; }}
+            .header {{ text-align: center; margin-bottom: 30px; }}
+            .header h1 {{ color: #38bdf8; font-size: 28px; margin-bottom: 6px; }}
+            .header p {{ color: #94a3b8; font-size: 14px; margin: 0; }}
+            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+            .card {{ background: #161f30; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }}
+            .card h3 {{ margin-top: 0; font-size: 15px; font-weight: 600; color: #e2e8f0; }}
+            @media (max-width: 768px) {{ .grid {{ grid-template-columns: 1fr; }} }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>MindSync - Métricas de Foco e Produtividade</h1>
-            <div class="sub">Agregação em Janelas de 15 Minutos</div>
-            
-            <div class="card">
-                <h3>Teclado: Produção Ativa vs Correções (Blocos 15m)</h3>
-                <canvas id="kbChart" height="90"></canvas>
+            <div class="header">
+                <h1>MindSync - Painel de Telemetria de Foco</h1>
+                <p>Métricas agregadas em intervalos de 15 minutos</p>
             </div>
+            
+            <div class="grid">
+                <!-- Gráfico 1: Volume de Teclas -->
+                <div class="card">
+                    <h3>Volume de Digitação (Total Teclas)</h3>
+                    <canvas id="keysChart" height="130"></canvas>
+                </div>
 
-            <div class="card">
-                <h3>Rato: Velocidade Média e Decisão/Retidão (Blocos 15m)</h3>
-                <canvas id="mouseChart" height="90"></canvas>
+                <!-- Gráfico 2: Taxa de Erro -->
+                <div class="card">
+                    <h3>Taxa de Erro / Correções (%)</h3>
+                    <canvas id="errorChart" height="130"></canvas>
+                </div>
+
+                <!-- Gráfico 3: Velocidade do Rato -->
+                <div class="card">
+                    <h3>Velocidade Média do Rato (px/s)</h3>
+                    <canvas id="speedChart" height="130"></canvas>
+                </div>
+
+                <!-- Gráfico 4: Retidão e Decisão -->
+                <div class="card">
+                    <h3>Índice de Decisão / Retidão do Rato (%)</h3>
+                    <canvas id="decisionChart" height="130"></canvas>
+                </div>
             </div>
         </div>
 
         <script>
-            new Chart(document.getElementById('kbChart'), {{
+            const labels = {all_buckets};
+            const barConfig = {{ maxBarThickness: 18, borderRadius: 4 }};
+
+            // 1. Teclas
+            new Chart(document.getElementById('keysChart'), {{
                 type: 'bar',
                 data: {{
-                    labels: {kb_labels},
-                    datasets: [
-                        {{ label: 'Teclas Úteis', data: {kb_keys_data}, backgroundColor: '#0ea5e9' }},
-                        {{ label: 'Correções (Backspace/Del)', data: {kb_corr_data}, backgroundColor: '#ef4444' }}
-                    ]
+                    labels: labels,
+                    datasets: [{{ label: 'Teclas', data: {kb_keys_data}, backgroundColor: '#0284c7', ...barConfig }}]
                 }},
-                options: {{ scales: {{ y: {{ beginAtZero: true }} }} }}
+                options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
             }});
 
-            new Chart(document.getElementById('mouseChart'), {{
+            // 2. Taxa de Erro
+            new Chart(document.getElementById('errorChart'), {{
+                type: 'bar',
+                data: {{
+                    labels: labels,
+                    datasets: [{{ label: 'Taxa Erro (%)', data: {kb_error_rate}, backgroundColor: '#ef4444', ...barConfig }}]
+                }},
+                options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true, max: 100 }} }} }}
+            }});
+
+            // 3. Velocidade Rato
+            new Chart(document.getElementById('speedChart'), {{
                 type: 'line',
                 data: {{
-                    labels: {kb_labels},
-                    datasets: [
-                        {{ label: 'Velocidade Média (px/s)', data: {mouse_speed_data}, borderColor: '#a855f7', backgroundColor: '#a855f7', tension: 0.2 }},
-                        {{ label: 'Retidão/Decisão (%)', data: {mouse_ratio_data}, borderColor: '#22c55e', backgroundColor: '#22c55e', tension: 0.2 }}
-                    ]
+                    labels: labels,
+                    datasets: [{{ label: 'px/s', data: {mouse_speed_data}, borderColor: '#8b5cf6', backgroundColor: 'rgba(139, 92, 246, 0.15)', fill: true, tension: 0.3 }}]
                 }},
-                options: {{ scales: {{ y: {{ beginAtZero: true }} }} }}
+                options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
+            }});
+
+            // 4. Retidão Rato
+            new Chart(document.getElementById('decisionChart'), {{
+                type: 'line',
+                data: {{
+                    labels: labels,
+                    datasets: [{{ label: 'Retidão (%)', data: {mouse_ratio_data}, borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.15)', fill: true, tension: 0.3 }}]
+                }},
+                options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ beginAtZero: true, max: 100 }} }} }}
             }});
         </script>
     </body>
