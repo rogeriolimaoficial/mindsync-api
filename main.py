@@ -5,7 +5,7 @@ from typing import List, Optional
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
-app = FastAPI(title="MindSync Central Multi-User API")
+app = FastAPI(title="MindSync Central Engine - Apple Watch Ready")
 
 DB_FILE = "mindsync.db"
 SECRET_API_TOKEN = "mindsync_biometrics_master_key_2026"
@@ -49,6 +49,18 @@ class UniversalBiometricsPayload(BaseModel):
 class BulkBiometricsPayload(BaseModel):
     user_id: str
     items: List[UniversalBiometricsPayload]
+
+# Modelo específico para exportações do Apple Watch / HealthKit
+class AppleWatchRawPayload(BaseModel):
+    user_id: str
+    date: str  # YYYY-MM-DD
+    hrv_sdnn_ms: float
+    resting_heart_rate_bpm: int
+    deep_sleep_minutes: float
+    rem_sleep_minutes: float
+    core_sleep_minutes: float
+    temp_wrist_celsius: Optional[float] = None
+    active_energy_burned_kcal: Optional[float] = None
 
 # --- DB INIT ---
 def init_db():
@@ -103,7 +115,7 @@ init_db()
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "service": "MindSync Multi-User Engine", "dashboard": "/dashboard"}
+    return {"status": "online", "service": "MindSync Engine (Apple Watch Ready)", "dashboard": "/dashboard"}
 
 # --- INGESTÃO TELEMETRIA ---
 @app.post("/api/telemetry")
@@ -120,45 +132,69 @@ def receive_telemetry(payload: TelemetryPayload):
     conn.close()
     return {"status": "success"}
 
-# --- INGESTÃO BIOMETRIA ---
-@app.post("/api/biometrics/bulk")
-def ingest_bulk_biometrics(payload: BulkBiometricsPayload, authorization: Optional[str] = Header(None)):
+# --- ENDPOINT DIRETO APPLE WATCH (COM CONVERSÃO MATEMÁTICA) ---
+@app.post("/api/biometrics/apple-watch")
+def ingest_apple_watch(payload: AppleWatchRawPayload, authorization: Optional[str] = Header(None)):
     if authorization != f"Bearer {SECRET_API_TOKEN}":
         raise HTTPException(status_code=401, detail="Token de autorização inválido.")
+    
+    # 1. Normalizar HRV: SDNN -> rMSSD
+    norm_hrv_rmssd = round(payload.hrv_sdnn_ms * 1.15, 1)
+    
+    # 2. Calcular Fases de Sono em Segundos
+    deep_sec = int(payload.deep_sleep_minutes * 60)
+    rem_sec = int(payload.rem_sleep_minutes * 60)
+    core_sec = int(payload.core_sleep_minutes * 60)
+    total_sleep_sec = deep_sec + rem_sec + core_sec
+    
+    # 3. Sleep Score (0 a 100)
+    sleep_target = 8.0 * 3600 # 8 horas ideal
+    sleep_ratio = min(1.0, total_sleep_sec / sleep_target)
+    sleep_score = round(sleep_ratio * 100, 1)
+    
+    # 4. Recovery Score Apple (Derivado de HRV e Sono)
+    hrv_factor = min(1.2, norm_hrv_rmssd / 60.0) # Base 60ms
+    recovery_score = round(min(100.0, (hrv_factor * 50.0) + (sleep_ratio * 50.0)), 1)
+    
+    # 5. Desvio de Temperatura
+    temp_dev = round(payload.temp_wrist_celsius - 36.5, 2) if payload.temp_wrist_celsius else 0.0
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    for item in payload.items:
-        cursor.execute("""
-            INSERT INTO biometrics_logs (
-                user_id, recorded_date, source, recovery_score, sleep_score, 
-                hrv_rmssd_ms, resting_heart_rate_bpm, total_sleep_seconds, 
-                deep_sleep_seconds, rem_sleep_seconds, sleep_efficiency_pct, 
-                daily_strain_score, temp_deviation_celsius, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, recorded_date) DO UPDATE SET
-                source=excluded.source,
-                recovery_score=excluded.recovery_score,
-                sleep_score=excluded.sleep_score,
-                hrv_rmssd_ms=excluded.hrv_rmssd_ms,
-                resting_heart_rate_bpm=excluded.resting_heart_rate_bpm,
-                total_sleep_seconds=excluded.total_sleep_seconds,
-                deep_sleep_seconds=excluded.deep_sleep_seconds,
-                rem_sleep_seconds=excluded.rem_sleep_seconds,
-                sleep_efficiency_pct=excluded.sleep_efficiency_pct,
-                daily_strain_score=excluded.daily_strain_score,
-                temp_deviation_celsius=excluded.temp_deviation_celsius,
-                created_at=excluded.created_at
-        """, (
-            item.user_id, item.recorded_date, item.source, item.recovery_score,
-            item.sleep_score, item.hrv_rmssd_ms, item.resting_heart_rate_bpm,
-            item.total_sleep_seconds, item.deep_sleep_seconds, item.rem_sleep_seconds,
-            item.sleep_efficiency_pct, item.daily_strain_score, item.temp_deviation_celsius,
-            datetime.now(timezone.utc).isoformat()
-        ))
+    cursor.execute("""
+        INSERT INTO biometrics_logs (
+            user_id, recorded_date, source, recovery_score, sleep_score, 
+            hrv_rmssd_ms, resting_heart_rate_bpm, total_sleep_seconds, 
+            deep_sleep_seconds, rem_sleep_seconds, sleep_efficiency_pct, 
+            daily_strain_score, temp_deviation_celsius, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, recorded_date) DO UPDATE SET
+            source='apple_watch',
+            recovery_score=excluded.recovery_score,
+            sleep_score=excluded.sleep_score,
+            hrv_rmssd_ms=excluded.hrv_rmssd_ms,
+            resting_heart_rate_bpm=excluded.resting_heart_rate_bpm,
+            total_sleep_seconds=excluded.total_sleep_seconds,
+            deep_sleep_seconds=excluded.deep_sleep_seconds,
+            rem_sleep_seconds=excluded.rem_sleep_seconds,
+            temp_deviation_celsius=excluded.temp_deviation_celsius,
+            created_at=excluded.created_at
+    """, (
+        payload.user_id, payload.date, "apple_watch", recovery_score, sleep_score,
+        norm_hrv_rmssd, payload.resting_heart_rate_bpm, total_sleep_sec,
+        deep_sec, rem_sec, 92.0, 12.0, temp_dev, datetime.now(timezone.utc).isoformat()
+    ))
     conn.commit()
     conn.close()
-    return {"status": "success", "registos_inseridos": len(payload.items)}
+    
+    return {
+        "status": "success",
+        "device": "Apple Watch",
+        "calculated_recovery": recovery_score,
+        "calculated_sleep_score": sleep_score,
+        "normalized_hrv_rmssd": norm_hrv_rmssd
+    }
 
 # --- DASHBOARD MULTI-UTILIZADOR ---
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -167,14 +203,12 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # 1. Obter lista de todos os utilizadores na base de dados
         cursor.execute("SELECT DISTINCT user_id FROM keyboard_logs UNION SELECT DISTINCT user_id FROM biometrics_logs")
         all_users = [row[0] for row in cursor.fetchall() if row[0]]
         
         if not user_id:
             user_id = all_users[0] if all_users else "miguel_user"
             
-        # 2. Biometria do utilizador selecionado
         cursor.execute("""
             SELECT recorded_date, source, recovery_score, sleep_score, hrv_rmssd_ms, 
                    resting_heart_rate_bpm, temp_deviation_celsius 
@@ -190,7 +224,7 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
         
         if bio_history:
             latest = bio_history[-1]
-            source_label = str(latest[1]).upper() if latest[1] else "WHOOP"
+            source_label = str(latest[1]).upper() if latest[1] else "APPLE_WATCH"
             recovery_val = latest[2] if latest[2] is not None else "--"
             sleep_val = latest[3] if latest[3] is not None else "--"
             hrv_val = latest[4] if latest[4] is not None else "--"
@@ -204,7 +238,6 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
                 bio_hrv.append(row[4] if row[4] is not None else 0)
                 bio_rhr.append(row[5] if row[5] is not None else 0)
 
-        # 3. Telemetria do utilizador selecionado
         cursor.execute("SELECT timestamp, total_keys, correction_keys FROM keyboard_logs WHERE user_id = ? ORDER BY id ASC", (user_id,))
         kb_rows = cursor.fetchall()
         cursor.execute("SELECT timestamp, speed_px_s, straightness_ratio FROM mouse_logs WHERE user_id = ? ORDER BY id ASC", (user_id,))
@@ -278,7 +311,6 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
         mouse_speed_data = [round(mouse_15m[b]["speed_sum"] / mouse_15m[b]["count"], 1) if b in mouse_15m and mouse_15m[b]["count"] > 0 else 0 for b in time_blocks]
         mouse_ratio_data = [round((mouse_15m[b]["ratio_sum"] / mouse_15m[b]["count"]) * 100, 1) if b in mouse_15m and mouse_15m[b]["count"] > 0 else 0 for b in time_blocks]
 
-        # Options HTML do select
         options_html = "".join([f'<option value="{u}" {"selected" if u == user_id else ""}>{u}</option>' for u in all_users])
         if not options_html:
             options_html = f'<option value="{user_id}" selected>{user_id}</option>'
@@ -317,7 +349,7 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
             <div class="container">
                 <div class="header">
                     <h1>MindSync - Motor de Telemetria & Biometria</h1>
-                    <p>Painel Multi-Utilizador • Hora Local (Portugal)</p>
+                    <p>Painel Multi-Utilizador • Suporte Apple Watch & Wearables</p>
                     
                     <div class="user-select-bar">
                         <label style="color:#94a3b8; font-size:13px;">Utilizador Ativo:</label>
@@ -337,7 +369,7 @@ def get_dashboard(user_id: Optional[str] = Query(None)):
                 </div>
 
                 <div class="section-card">
-                    <h3>Tendência Fisiológica ({user_id} - Últimos 14 Dias)</h3>
+                    <h3>Tendência Fisiológica ({user_id} - Apple Watch / Bio)</h3>
                     <canvas id="bioTrendChart" height="90"></canvas>
                 </div>
 
