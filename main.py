@@ -1,12 +1,11 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import sqlite3
-import os
 from datetime import datetime, timezone, timedelta
 
-app = FastAPI(title="MindSync Central API")
+app = FastAPI(title="MindSync Central Multi-User API")
 
 DB_FILE = "mindsync.db"
 SECRET_API_TOKEN = "mindsync_biometrics_master_key_2026"
@@ -51,7 +50,7 @@ class BulkBiometricsPayload(BaseModel):
     user_id: str
     items: List[UniversalBiometricsPayload]
 
-# --- BASE DE DADOS ---
+# --- DB INIT ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -81,7 +80,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS biometrics_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
-            recorded_date TEXT UNIQUE,
+            recorded_date TEXT,
             source TEXT,
             recovery_score REAL,
             sleep_score REAL,
@@ -93,7 +92,8 @@ def init_db():
             sleep_efficiency_pct REAL,
             daily_strain_score REAL,
             temp_deviation_celsius REAL,
-            created_at TEXT
+            created_at TEXT,
+            UNIQUE(user_id, recorded_date)
         )
     """)
     conn.commit()
@@ -103,9 +103,9 @@ init_db()
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "service": "MindSync Engine v4.2", "dashboard": "/dashboard"}
+    return {"status": "online", "service": "MindSync Multi-User Engine", "dashboard": "/dashboard"}
 
-# --- ROTAS TELEMETRIA ---
+# --- INGESTÃO TELEMETRIA ---
 @app.post("/api/telemetry")
 def receive_telemetry(payload: TelemetryPayload):
     conn = sqlite3.connect(DB_FILE)
@@ -120,11 +120,11 @@ def receive_telemetry(payload: TelemetryPayload):
     conn.close()
     return {"status": "success"}
 
-# --- ROTAS BIOMETRIA ---
+# --- INGESTÃO BIOMETRIA ---
 @app.post("/api/biometrics/bulk")
 def ingest_bulk_biometrics(payload: BulkBiometricsPayload, authorization: Optional[str] = Header(None)):
     if authorization != f"Bearer {SECRET_API_TOKEN}":
-        raise HTTPException(status_code=401, detail="Token de autorizacao invalido.")
+        raise HTTPException(status_code=401, detail="Token de autorização inválido.")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     for item in payload.items:
@@ -136,7 +136,7 @@ def ingest_bulk_biometrics(payload: BulkBiometricsPayload, authorization: Option
                 daily_strain_score, temp_deviation_celsius, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(recorded_date) DO UPDATE SET
+            ON CONFLICT(user_id, recorded_date) DO UPDATE SET
                 source=excluded.source,
                 recovery_score=excluded.recovery_score,
                 sleep_score=excluded.sleep_score,
@@ -160,20 +160,28 @@ def ingest_bulk_biometrics(payload: BulkBiometricsPayload, authorization: Option
     conn.close()
     return {"status": "success", "registos_inseridos": len(payload.items)}
 
-# --- DASHBOARD SEGURO ---
+# --- DASHBOARD MULTI-UTILIZADOR ---
 @app.get("/dashboard", response_class=HTMLResponse)
-def get_dashboard():
+def get_dashboard(user_id: Optional[str] = Query(None)):
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # 1. Carregar Biometria de forma segura
+        # 1. Obter lista de todos os utilizadores na base de dados
+        cursor.execute("SELECT DISTINCT user_id FROM keyboard_logs UNION SELECT DISTINCT user_id FROM biometrics_logs")
+        all_users = [row[0] for row in cursor.fetchall() if row[0]]
+        
+        if not user_id:
+            user_id = all_users[0] if all_users else "miguel_user"
+            
+        # 2. Biometria do utilizador selecionado
         cursor.execute("""
             SELECT recorded_date, source, recovery_score, sleep_score, hrv_rmssd_ms, 
                    resting_heart_rate_bpm, temp_deviation_celsius 
             FROM biometrics_logs 
+            WHERE user_id = ?
             ORDER BY recorded_date ASC LIMIT 14
-        """)
+        """, (user_id,))
         bio_history = cursor.fetchall()
         
         source_label = "NENHUMA"
@@ -196,10 +204,10 @@ def get_dashboard():
                 bio_hrv.append(row[4] if row[4] is not None else 0)
                 bio_rhr.append(row[5] if row[5] is not None else 0)
 
-        # 2. Carregar Telemetria
-        cursor.execute("SELECT timestamp, total_keys, correction_keys FROM keyboard_logs ORDER BY id ASC")
+        # 3. Telemetria do utilizador selecionado
+        cursor.execute("SELECT timestamp, total_keys, correction_keys FROM keyboard_logs WHERE user_id = ? ORDER BY id ASC", (user_id,))
         kb_rows = cursor.fetchall()
-        cursor.execute("SELECT timestamp, speed_px_s, straightness_ratio FROM mouse_logs ORDER BY id ASC")
+        cursor.execute("SELECT timestamp, speed_px_s, straightness_ratio FROM mouse_logs WHERE user_id = ? ORDER BY id ASC", (user_id,))
         mouse_rows = cursor.fetchall()
         conn.close()
 
@@ -211,7 +219,6 @@ def get_dashboard():
             except:
                 return None
 
-        # Processamento Teclado
         minute_kb = {}
         for ts, total, corr in kb_rows:
             dt_local = parse_to_portugal(ts)
@@ -243,7 +250,6 @@ def get_dashboard():
             kb_15m[block_dt]["speeds"].append(norm["keys_per_min"])
             kb_15m[block_dt]["error_rates"].append(norm["error_rate"])
 
-        # Processamento Rato
         mouse_15m = {}
         for ts, speed, ratio in mouse_rows:
             dt_local = parse_to_portugal(ts)
@@ -272,12 +278,17 @@ def get_dashboard():
         mouse_speed_data = [round(mouse_15m[b]["speed_sum"] / mouse_15m[b]["count"], 1) if b in mouse_15m and mouse_15m[b]["count"] > 0 else 0 for b in time_blocks]
         mouse_ratio_data = [round((mouse_15m[b]["ratio_sum"] / mouse_15m[b]["count"]) * 100, 1) if b in mouse_15m and mouse_15m[b]["count"] > 0 else 0 for b in time_blocks]
 
+        # Options HTML do select
+        options_html = "".join([f'<option value="{u}" {"selected" if u == user_id else ""}>{u}</option>' for u in all_users])
+        if not options_html:
+            options_html = f'<option value="{user_id}" selected>{user_id}</option>'
+
         html_content = f"""
         <!DOCTYPE html>
         <html lang="pt">
         <head>
             <meta charset="UTF-8">
-            <title>MindSync Dashboard</title>
+            <title>MindSync Multi-User Dashboard</title>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
                 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f8fafc; padding: 25px; }}
@@ -285,11 +296,16 @@ def get_dashboard():
                 .header {{ text-align: center; margin-bottom: 25px; }}
                 .header h1 {{ color: #38bdf8; font-size: 28px; margin-bottom: 4px; }}
                 .header p {{ color: #94a3b8; font-size: 14px; margin: 0; }}
+                
+                .user-select-bar {{ margin-top: 15px; display: flex; justify-content: center; align-items: center; gap: 10px; }}
+                .user-select-bar select {{ background: #1e293b; color: #38bdf8; border: 1px solid #334155; padding: 6px 12px; border-radius: 8px; font-weight: bold; cursor: pointer; }}
+                
                 .bio-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }}
                 .bio-card {{ background: linear-gradient(145deg, #161f30, #0f172a); border: 1px solid #1e293b; border-radius: 10px; padding: 12px 10px; text-align: center; }}
                 .bio-title {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; margin-bottom: 4px; }}
                 .bio-val {{ font-size: 22px; font-weight: 700; color: #38bdf8; }}
                 .source-tag {{ display: inline-block; background: #0284c7; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; margin-bottom: 15px; }}
+                
                 .section-card {{ background: #161f30; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; margin-bottom: 25px; }}
                 .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
                 .card {{ background: #161f30; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; }}
@@ -301,8 +317,15 @@ def get_dashboard():
             <div class="container">
                 <div class="header">
                     <h1>MindSync - Motor de Telemetria & Biometria</h1>
-                    <p>Hora Local (Portugal) • Blocos Contínuos de 15 Minutos</p>
-                    <div style="margin-top: 8px;"><span class="source-tag">Fonte Ativa: {source_label}</span></div>
+                    <p>Painel Multi-Utilizador • Hora Local (Portugal)</p>
+                    
+                    <div class="user-select-bar">
+                        <label style="color:#94a3b8; font-size:13px;">Utilizador Ativo:</label>
+                        <select onchange="window.location.href='/dashboard?user_id=' + this.value">
+                            {options_html}
+                        </select>
+                        <span class="source-tag" style="margin-bottom:0;">Fonte: {source_label}</span>
+                    </div>
                 </div>
                 
                 <div class="bio-grid">
@@ -314,7 +337,7 @@ def get_dashboard():
                 </div>
 
                 <div class="section-card">
-                    <h3>Tendência Fisiológica (Últimos 14 Dias)</h3>
+                    <h3>Tendência Fisiológica ({user_id} - Últimos 14 Dias)</h3>
                     <canvas id="bioTrendChart" height="90"></canvas>
                 </div>
 
@@ -384,4 +407,4 @@ def get_dashboard():
         """
         return html_content
     except Exception as e:
-        return HTMLResponse(content=f"<h2 style='color:red;font-family:sans-serif;'>Erro ao gerar dashboard: {str(e)}</h2>", status_code=500)
+        return HTMLResponse(content=f"<h2 style='color:red;'>Erro: {str(e)}</h2>", status_code=500)
