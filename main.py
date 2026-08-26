@@ -1,48 +1,66 @@
-import sqlite3
-import time
-from typing import List, Optional
-from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from typing import List
+import sqlite3
+import os
+from datetime import datetime, timezone
 
-app = FastAPI(
-    title="MindSync Central API",
-    description="API central para agregação de telemetria e biometria.",
-    version="1.0.0"
-)
+app = FastAPI(title="MindSync Central API")
 
-# Permitir pedidos de qualquer frontend/dashboard (CORS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+DB_FILE = "mindsync.db"
 
-DB_NAME = "mindsync.db"
+# --- ESTRUTURA DOS DADOS ---
+class KeyboardEvent(BaseModel):
+    timestamp: str
+    duration_s: int
+    total_keys: int
+    correction_keys: int
 
+class MouseEvent(BaseModel):
+    timestamp: str
+    duration_s: float
+    distance_px: float
+    straight_distance_px: float
+    straightness_ratio: float
+    speed_px_s: float
+
+class TelemetryPayload(BaseModel):
+    user_id: str
+    keyboard_events: List[KeyboardEvent]
+    mouse_events: List[MouseEvent]
+
+# --- BASE DE DADOS ---
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    # Como mudámos a estrutura, apagamos a DB antiga (localmente) se existir
+    if os.path.exists(DB_FILE):
+        try:
+            os.remove(DB_FILE)
+        except:
+            pass
+            
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pc_events (
+        CREATE TABLE IF NOT EXISTS keyboard_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
-            timestamp REAL,
-            event_type TEXT,
-            value REAL,
-            received_at REAL
+            timestamp TEXT,
+            duration_s INTEGER,
+            total_keys INTEGER,
+            correction_keys INTEGER
         )
     """)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS api_logs (
+        CREATE TABLE IF NOT EXISTS mouse_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL,
             user_id TEXT,
-            message TEXT,
-            event_count INTEGER
+            timestamp TEXT,
+            duration_s REAL,
+            distance_px REAL,
+            straight_distance_px REAL,
+            straightness_ratio REAL,
+            speed_px_s REAL
         )
     """)
     conn.commit()
@@ -50,89 +68,124 @@ def init_db():
 
 init_db()
 
-# --- Modelos Pydantic ---
-class EventItem(BaseModel):
-    timestamp: float
-    event_type: str
-    value: float
-
-class TelemetryBatch(BaseModel):
-    user_id: str
-    batch_timestamp: Optional[float] = None
-    events: List[EventItem]
-
-# --- Endpoints ---
-
+# --- ROTAS DA API ---
 @app.get("/")
-def home():
-    return {
-        "status": "online",
-        "service": "MindSync Central API",
-        "time": datetime.utcnow().isoformat()
-    }
+def read_root():
+    return {"status": "online", "service": "MindSync Central API v2"}
 
-# Recebe os dados de hora a hora do teu tracker.py
 @app.post("/api/telemetry")
-def receive_telemetry(batch: TelemetryBatch):
-    if not batch.events:
-        return {"status": "ignored", "message": "Lote vazio."}
-
-    now = time.time()
-    conn = sqlite3.connect(DB_NAME)
+def receive_telemetry(payload: TelemetryPayload):
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
+    # Guardar Teclado
+    for kb in payload.keyboard_events:
+        cursor.execute("""
+            INSERT INTO keyboard_logs (user_id, timestamp, duration_s, total_keys, correction_keys)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (payload.user_id, kb.timestamp, kb.duration_s, kb.total_keys, kb.correction_keys))
+        
+    # Guardar Rato
+    for mouse in payload.mouse_events:
+        cursor.execute("""
+            INSERT INTO mouse_logs (user_id, timestamp, duration_s, distance_px, straight_distance_px, straightness_ratio, speed_px_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (payload.user_id, mouse.timestamp, mouse.duration_s, mouse.distance_px, mouse.straight_distance_px, mouse.straightness_ratio, mouse.speed_px_s))
+        
+    conn.commit()
+    conn.close()
+    
+    return {"status": "success", "kb_events": len(payload.keyboard_events), "mouse_events": len(payload.mouse_events)}
 
-    try:
-        records = [
-            (batch.user_id, e.timestamp, e.event_type, e.value, now)
-            for e in batch.events
-        ]
-        cursor.executemany(
-            "INSERT INTO pc_events (user_id, timestamp, event_type, value, received_at) VALUES (?, ?, ?, ?, ?)",
-            records
-        )
-
-        # Regista nos logs internos para poderes consultar facilmente
-        cursor.execute(
-            "INSERT INTO api_logs (timestamp, user_id, message, event_count) VALUES (?, ?, ?, ?)",
-            (now, batch.user_id, "Lote recebido com sucesso", len(records))
-        )
-        conn.commit()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Recebidos {len(records)} eventos de {batch.user_id}")
-        return {
-            "status": "success",
-            "received_count": len(records),
-            "timestamp": now
-        }
-    except Exception as e:
-        conn.rollback()
-        print(f"[ERRO] Falha ao guardar dados: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-# Endpoint para verificares o estado e os últimos envios recebidos (DEBUG/TESTE)
 @app.get("/api/debug-status")
 def debug_status():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM keyboard_logs")
+    kb_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM mouse_logs")
+    mouse_count = cursor.fetchone()[0]
+    conn.close()
+    return {"status": "ok", "teclado_guardado": kb_count, "rato_guardado": mouse_count}
 
-    cursor.execute("SELECT COUNT(*) FROM pc_events")
-    total_events = cursor.fetchone()[0]
-
-    cursor.execute("SELECT timestamp, user_id, message, event_count FROM api_logs ORDER BY id DESC LIMIT 10")
-    logs = [
-        {
-            "time": datetime.utcfromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M:%S UTC'),
-            "user_id": row[1],
-            "message": row[2],
-            "event_count": row[3]
-        }
-        for row in cursor.fetchall()
-    ]
+# --- DASHBOARD VISUAL (HTML + Chart.js) ---
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard():
+    # Extrai os últimos 100 blocos de teclado e rato para o gráfico
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT timestamp, total_keys, correction_keys FROM keyboard_logs ORDER BY id DESC LIMIT 50")
+    kb_data = cursor.fetchall()[::-1] # Inverter para ordem cronológica
+    
+    cursor.execute("SELECT timestamp, speed_px_s, straightness_ratio FROM mouse_logs ORDER BY id DESC LIMIT 50")
+    mouse_data = cursor.fetchall()[::-1]
     conn.close()
 
-    return {
-        "database_status": "ok",
-        "total_events_stored": total_events,
-        "recent_logs": logs
-    }
+    # Prepara os dados para o Javascript
+    kb_labels = [row[0][11:19] for row in kb_data]
+    kb_keys = [row[1] for row in kb_data]
+    
+    mouse_labels = [row[0][11:19] for row in mouse_data]
+    mouse_speed = [row[1] for row in mouse_data]
+    mouse_straight = [row[2] * 100 for row in mouse_data] # Passar a %
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="pt">
+    <head>
+        <meta charset="UTF-8">
+        <title>MindSync Dashboard</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 20px; }}
+            .container {{ max-width: 1000px; margin: 0 auto; }}
+            .card {{ background: #1e293b; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
+            h1 {{ text-align: center; color: #38bdf8; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>MindSync - Análise de Fluxo de Trabalho</h1>
+            
+            <div class="card">
+                <h3>Teclado: Produtividade vs Correções (Blocos 5s)</h3>
+                <canvas id="kbChart" height="80"></canvas>
+            </div>
+
+            <div class="card">
+                <h3>Rato: Velocidade e Decisão (Trajetórias)</h3>
+                <canvas id="mouseChart" height="80"></canvas>
+            </div>
+        </div>
+
+        <script>
+            // Gráfico Teclado
+            new Chart(document.getElementById('kbChart'), {{
+                type: 'bar',
+                data: {{
+                    labels: {kb_labels},
+                    datasets: [
+                        {{ label: 'Teclas Úteis', data: {kb_keys}, backgroundColor: '#38bdf8' }}
+                    ]
+                }},
+                options: {{ scales: {{ y: {{ beginAtZero: true }} }} }}
+            }});
+
+            // Gráfico Rato
+            new Chart(document.getElementById('mouseChart'), {{
+                type: 'line',
+                data: {{
+                    labels: {mouse_labels},
+                    datasets: [
+                        {{ label: 'Velocidade (px/s)', data: {mouse_speed}, borderColor: '#a855f7', tension: 0.3 }},
+                        {{ label: 'Retidão (%)', data: {mouse_straight}, borderColor: '#4ade80', tension: 0.3 }}
+                    ]
+                }},
+                options: {{ scales: {{ y: {{ beginAtZero: true }} }} }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
