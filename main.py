@@ -294,6 +294,120 @@ def ingest_aw(p: AppleWatchPayload, _: None = Depends(verify_token)):
     )
     return {"status": "success"}
 
+# ---- Apple Watch via Atalhos (iOS): o atalho envia linhas de texto, o servidor faz as contas ----
+class AppleWatchRawPayload(BaseModel):
+    user_id: str
+    sleep_lines: str = Field(default="", max_length=200_000)   # "Fase|início|fim", uma por linha
+    hrv_values: str = Field(default="", max_length=50_000)     # um valor (ms) por linha
+    resting_hr: str = Field(default="", max_length=5_000)      # um valor (bpm) por linha
+    date: Optional[str] = None                                 # AAAA-MM-DD; por omissão, dia em que acordaste
+
+_STAGES = [  # por ordem de prioridade quando há sobreposição
+    ("deep", ("deep", "profund")),
+    ("rem", ("rem",)),
+    ("core", ("core", "núcleo", "nucleo", "principal", "central")),
+    ("asleep", ("asleep", "adorm", "unspecified", "não especificad", "nao especificad")),
+]
+_IGNORED = ("awake", "acordad", "desperto", "in bed", "inbed", "na cama", "cama")
+
+def _classify_stage(raw: str) -> Optional[str]:
+    s = raw.strip().lower()
+    if any(k in s for k in _IGNORED):
+        return "ignore"
+    for name, keys in _STAGES:
+        if any(s == k or s.startswith(k) for k in keys):
+            return name
+    return None
+
+def _parse_dt(txt: str) -> Optional[pd.Timestamp]:
+    txt = txt.strip()
+    try:
+        ts = pd.Timestamp(datetime.fromisoformat(txt.replace("Z", "+00:00")))
+    except Exception:
+        try:
+            ts = pd.to_datetime(txt, dayfirst=True)
+        except Exception:
+            return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize(LISBON_TZ) if ts.tzinfo is None else ts.tz_convert(LISBON_TZ)
+
+def _merge(iv):
+    out = []
+    for a, b in sorted(iv):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+def _subtract(iv, cut):
+    out = []
+    for a, b in iv:
+        cur = a
+        for c, d in cut:
+            if d <= cur or c >= b:
+                continue
+            if c > cur:
+                out.append((cur, c))
+            cur = max(cur, d)
+        if cur < b:
+            out.append((cur, b))
+    return out
+
+def _minutes(iv) -> float:
+    return sum((b - a).total_seconds() for a, b in iv) / 60.0
+
+def _numbers(txt: str) -> list:
+    import re
+    return [float(x.replace(",", ".")) for x in re.findall(r"-?\d+(?:[.,]\d+)?", txt or "")]
+
+@app.post("/api/biometrics/apple-watch-raw")
+def ingest_aw_raw(p: AppleWatchRawPayload, _: None = Depends(verify_token)):
+    by_stage = {k: [] for k, _ in _STAGES}
+    unknown, parsed, last_end = set(), 0, None
+    for line in p.sleep_lines.splitlines():
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) < 3 or not parts[0]:
+            continue
+        stage = _classify_stage(parts[0])
+        a, b = _parse_dt(parts[1]), _parse_dt(parts[2])
+        if a is None or b is None or b <= a:
+            continue
+        if stage is None:
+            unknown.add(parts[0])
+            continue
+        if stage == "ignore":
+            continue
+        by_stage[stage].append((a, b))
+        parsed += 1
+        last_end = b if last_end is None or b > last_end else last_end
+    if parsed == 0:
+        raise HTTPException(status_code=422, detail={
+            "erro": "Nenhuma linha de sono reconhecida", "fases_desconhecidas": sorted(unknown),
+            "exemplo_esperado": "Core|2026-11-23T01:10:00+00:00|2026-11-23T02:00:00+00:00"})
+
+    # prioridade deep > rem > core > asleep: o que já foi contado numa fase não conta noutra
+    merged, taken = {}, []
+    for name, _k in _STAGES:
+        mine = _subtract(_merge(by_stage[name]), taken)
+        merged[name] = mine
+        taken = _merge(taken + mine)
+    mins = {k: round(_minutes(v), 1) for k, v in merged.items()}
+    total = round(sum(mins.values()), 1)
+
+    hrv_list, rhr_list = _numbers(p.hrv_values), _numbers(p.resting_hr)
+    hrv = round(sum(hrv_list) / len(hrv_list), 1) if hrv_list else None       # SDNN (ms), média das leituras
+    rhr = int(round(rhr_list[-1])) if rhr_list else None
+    date_str = p.date or last_end.strftime("%Y-%m-%d")
+    # mesma aproximação SDNN -> RMSSD (~1.15x) do endpoint antigo: heurística, não conversão validada
+    norm_hrv = round(hrv * 1.15, 1) if hrv is not None else None
+    save_bio(p.user_id, date_str, "Apple Watch", rhr, norm_hrv, int(total * 60),
+             int(mins["deep"] * 60), int(mins["rem"] * 60), None)
+    return {"status": "success", "date": date_str, "sleep_min": {**mins, "total": total},
+            "hrv_sdnn_ms": hrv, "hrv_leituras": len(hrv_list), "resting_hr": rhr,
+            "linhas_sono_lidas": parsed, "fases_desconhecidas": sorted(unknown)}
+
 @app.post("/api/biometrics/whoop")
 def ingest_whoop(p: WhoopPayload, _: None = Depends(verify_token)):
     save_bio(
@@ -362,7 +476,7 @@ def dashboard_status(token: Optional[str] = None):
             (u,),
         )
         b_row = cursor.fetchone()
-        bio_info = f"{b_row[1]} ({b_row[0]} | Rec: {b_row[2]}% | HRV: {b_row[3]}ms)" if b_row else "Sem Wearable"
+        bio_info = (f"{b_row[1]} ({b_row[0]}" + (f" | Rec: {b_row[2]}%" if b_row[2] is not None else "") + (f" | HRV: {b_row[3]}ms" if b_row[3] is not None else "") + ")") if b_row else "Sem Wearable"
 
         status_html = '<span style="color:#ef4444; font-weight:bold;">● Sem dados recentes</span>'
         last_seen = "Sem dados"

@@ -20,7 +20,7 @@ Atualizar quando fechares algo relevante. Quem abre um chat novo cola este fiche
 - [ ] Rodar segredos da Oura e do token da API, limpar o histórico do repo
 - [ ] Testar o tracker no PC e correr 1 semana
 - [ ] Pôr o `/checkin` no ecrã inicial do telemóvel e responder a cada 60 a 90 min
-- [ ] Ligar o Apple Watch (sono, HRV, FC em repouso) ao endpoint `/api/biometrics/apple-watch`
+- [ ] Criar o atalho do Apple Watch (ver `APPLE_WATCH.md`) e testar com o endpoint `/api/biometrics/apple-watch-raw` (feito e testado no servidor, falta testar o atalho no iPhone)
 - [ ] Decidir normalização por utilizador (baseline rolante)
 
 ## Em aberto

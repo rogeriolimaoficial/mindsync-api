@@ -9,6 +9,7 @@ Recolhe sinais de comportamento no PC e, com labels de energia, treina um modelo
 | `main.py` | servidor FastAPI (ingestão, wearables, labels, dashboard, downloads) |
 | `features.py` | agrega janelas de 5s em blocos de 15 min |
 | `pages.py` | páginas `/explore` (gráficos) e `/checkin` (energia e foco) |
+| `APPLE_WATCH.md` | passos do atalho do iPhone que envia sono, HRV e FC em repouso |
 | `view_data.py` | imprime os blocos de um utilizador/dia |
 | `auth.py`, `server.py`, `get_token.py`, `get_sleep_data.py` | autorização e leitura de sono da Oura |
 
