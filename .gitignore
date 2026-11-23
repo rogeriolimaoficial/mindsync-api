@@ -1,0 +1,13 @@
+.env
+token.json
+config.txt
+*.db
+*.db-wal
+*.db-shm
+*.csv
+*.xlsx
+raw/
+__pycache__/
+*.pyc
+venv/
+.venv/

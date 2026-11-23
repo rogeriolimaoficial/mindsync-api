@@ -1,3 +1,4 @@
+import html
 import logging
 import os
 import sqlite3
@@ -7,8 +8,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
+
+from features import build_blocks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mindsync")
@@ -16,41 +19,43 @@ logger = logging.getLogger("mindsync")
 app = FastAPI(title="MindSync Simple Hub")
 
 DB_FILE = "mindsync.db"
-CSV_FILE = "mindsync_live.csv"
 XLSX_FILE = "mindsync_dataset.xlsx"
 LISBON_TZ = ZoneInfo("Europe/Lisbon")
 
-# O token TEM de vir de uma env var no Render (ver requirements/instruções).
+# O token TEM de vir de uma env var no Render.
 # O valor por omissão só existe para não partir em dev local; nunca o uses em produção.
 SECRET_API_TOKEN = os.environ.get("MINDSYNC_API_TOKEN", "changeme-local-dev-only")
 if SECRET_API_TOKEN == "changeme-local-dev-only":
     logger.warning(
-        "MINDSYNC_API_TOKEN não definido — a usar token de desenvolvimento. "
+        "MINDSYNC_API_TOKEN não definido, a usar token de desenvolvimento. "
         "Define a env var no Render antes de ir para produção."
     )
 
 # ==========================================
 # MODELOS DE ENTRADA
 # ==========================================
-class KeyboardEvent(BaseModel):
-    timestamp: str
-    duration_s: int
-    total_keys: int
-    correction_keys: int
-
-class MouseEvent(BaseModel):
-    timestamp: str
-    duration_s: float
-    distance_px: float
-    straight_distance_px: float
-    straightness_ratio: float
-    speed_px_s: float
+class Window5s(BaseModel):
+    """Totais de uma janela de 5s (ver tracker.py)."""
+    window_start: str
+    keys: int = 0
+    backspaces: int = 0
+    corr_episodes: int = 0
+    n_iki: int = 0
+    sum_iki: float = 0.0
+    sumsq_iki: float = 0.0
+    micro_pauses: int = 0
+    kb_active: int = 0
+    path_px: float = 0.0
+    disp_px: float = 0.0
+    gesture_s: float = 0.0
+    gestures: int = 0
+    dir_changes: int = 0
+    clicks: int = 0
 
 class TelemetryBatchPayload(BaseModel):
     user_id: str
     os_type: str = Field(default="windows")
-    keyboard_events: List[KeyboardEvent]
-    mouse_events: List[MouseEvent]
+    windows: List[Window5s] = Field(max_length=2000)
 
 class AppleWatchPayload(BaseModel):
     user_id: str
@@ -104,6 +109,7 @@ class GroundTruthPlaceholder(BaseModel):
     slot_2: Optional[int] = None
     notes: Optional[str] = None
 
+
 # ==========================================
 # LIGAÇÃO À BASE DE DADOS
 # ==========================================
@@ -119,18 +125,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 def init_db():
     conn = get_conn()
     cursor = conn.cursor()
+    # Uma linha por janela de 5s ativa, com TOTAIS (não médias).
+    # UNIQUE evita duplicados quando o tracker reenvia um lote.
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS telemetry_15m (
+        CREATE TABLE IF NOT EXISTS windows_5s (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
+            user_id TEXT NOT NULL,
             os_type TEXT,
-            timestamp_block TEXT,
-            active_minutes INTEGER,
-            typing_speed_kpm REAL,
-            error_rate_pct REAL,
-            mouse_speed_px_s REAL,
-            straightness_pct REAL,
-            created_at TEXT
+            window_start TEXT NOT NULL,
+            keys INTEGER, backspaces INTEGER, corr_episodes INTEGER,
+            n_iki INTEGER, sum_iki REAL, sumsq_iki REAL, micro_pauses INTEGER,
+            kb_active INTEGER,
+            path_px REAL, disp_px REAL, gesture_s REAL, gestures INTEGER,
+            dir_changes INTEGER, clicks INTEGER,
+            created_at TEXT,
+            UNIQUE(user_id, window_start)
         )
     """)
     cursor.execute("""
@@ -159,7 +168,7 @@ def init_db():
             notes TEXT
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_user_block ON telemetry_15m(user_id, timestamp_block)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_windows_user_ts ON windows_5s(user_id, window_start)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bio_user_date ON daily_biometrics(user_id, recorded_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_labels_user_ts ON ground_truth_labels(user_id, timestamp)")
     conn.commit()
@@ -167,21 +176,16 @@ def init_db():
 
 init_db()
 
-def export_live_csv():
-    try:
-        conn = get_conn()
-        t_df = pd.read_sql_query("SELECT * FROM telemetry_15m", conn)
-        b_df = pd.read_sql_query("SELECT * FROM daily_biometrics", conn)
-        conn.close()
-
-        if not t_df.empty:
-            t_df["date_key"] = t_df["timestamp_block"].str.slice(0, 10)
-            merged = pd.merge(
-                t_df, b_df, left_on=["user_id", "date_key"], right_on=["user_id", "recorded_date"], how="left"
-            )
-            merged.to_csv(CSV_FILE, index=False)
-    except Exception:
-        logger.exception("Falha ao exportar CSV")
+def build_dataset(conn) -> pd.DataFrame:
+    """Blocos de 15 min (calculados a partir das janelas) + biometria do dia."""
+    blocks = build_blocks(conn)
+    bio = pd.read_sql_query("SELECT * FROM daily_biometrics", conn)
+    if blocks.empty or bio.empty:
+        return blocks
+    return blocks.merge(
+        bio.drop(columns=["id", "created_at"]),
+        left_on=["user_id", "local_date"], right_on=["user_id", "recorded_date"], how="left",
+    )
 
 def parse_event_timestamp(ts: str) -> Optional[datetime]:
     try:
@@ -190,89 +194,50 @@ def parse_event_timestamp(ts: str) -> Optional[datetime]:
         return None
 
 # ==========================================
-# MOTOR DE INGESTÃO E AGREGAÇÃO (5s -> 1m -> 15m)
+# INGESTÃO DE TELEMETRIA (janelas de 5s; a agregação a 15 min é feita em features.py)
 # ==========================================
 @app.post("/api/telemetry")
 def receive_telemetry(payload: TelemetryBatchPayload, _: None = Depends(verify_token)):
-    event_times = []
-
-    # 1. Agrupamento por minuto e cálculo de cadência ativa
-    minute_samples = {}
-    for kb in payload.keyboard_events:
-        if kb.total_keys > 0:  # Ignora 5s com zero dados
-            dt = parse_event_timestamp(kb.timestamp)
-            if dt is None:
-                logger.warning("Timestamp de teclado inválido, a ignorar evento: %s", kb.timestamp)
-                continue
-            event_times.append(dt)
-            min_key = dt.strftime("%Y-%m-%d %H:%M")
-            if min_key not in minute_samples:
-                minute_samples[min_key] = {"keys": 0, "corr": 0, "active_5s": 0}
-            minute_samples[min_key]["keys"] += kb.total_keys
-            minute_samples[min_key]["corr"] += kb.correction_keys
-            minute_samples[min_key]["active_5s"] += 1
-
-    for m in payload.mouse_events:
-        dt = parse_event_timestamp(m.timestamp)
-        if dt is not None:
-            event_times.append(dt)
-
-    if not minute_samples and not payload.mouse_events:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    os_type = payload.os_type.lower()
+    rows = []
+    for w in payload.windows:
+        dt = parse_event_timestamp(w.window_start)
+        if dt is None:
+            logger.warning("Timestamp inválido, a ignorar janela: %s", w.window_start)
+            continue
+        rows.append((
+            payload.user_id, os_type, dt.strftime("%Y-%m-%d %H:%M:%S"),
+            w.keys, w.backspaces, w.corr_episodes,
+            w.n_iki, w.sum_iki, w.sumsq_iki, w.micro_pauses,
+            w.kb_active,
+            w.path_px, w.disp_px, w.gesture_s, w.gestures,
+            w.dir_changes, w.clicks,
+            now_iso,
+        ))
+    if not rows:
         return {"status": "ignored_idle"}
 
-    # Transpor para 1 minuto
-    min_speeds = []
-    min_errors = []
-    for m_k, d in minute_samples.items():
-        if d["active_5s"] > 0:
-            kpm = d["keys"] * (12.0 / d["active_5s"])
-            err = (d["corr"] / d["keys"]) * 100.0 if d["keys"] > 0 else 0.0
-            min_speeds.append(kpm)
-            min_errors.append(err)
-
-    # Métricas de rato
-    mouse_speeds = [m.speed_px_s for m in payload.mouse_events if m.speed_px_s > 0]
-    mouse_ratios = [m.straightness_ratio * 100.0 for m in payload.mouse_events if m.straightness_ratio > 0]
-
-    # Consolidação do bloco: usa a hora dos EVENTOS (não a hora de chegada do request)
-    # e arredonda para o início do bloco de 15 min a que pertence.
-    reference_dt = max(event_times) if event_times else datetime.now(timezone.utc)
-    block_minute = (reference_dt.minute // 15) * 15
-    block_dt = reference_dt.replace(minute=block_minute, second=0, microsecond=0)
-    block_time = block_dt.strftime("%Y-%m-%d %H:%M:00")
-
-    active_mins = len(min_speeds)
-    avg_kpm = round(sum(min_speeds) / active_mins, 1) if active_mins > 0 else 0.0
-    avg_err = round(sum(min_errors) / active_mins, 1) if active_mins > 0 else 0.0
-    avg_mouse_spd = round(sum(mouse_speeds) / len(mouse_speeds), 1) if mouse_speeds else 0.0
-    avg_straight = round(sum(mouse_ratios) / len(mouse_ratios), 1) if mouse_ratios else 100.0
-
     conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
+    before = conn.total_changes
+    conn.executemany(
         """
-        INSERT INTO telemetry_15m (
-            user_id, os_type, timestamp_block, active_minutes,
-            typing_speed_kpm, error_rate_pct, mouse_speed_px_s, straightness_pct, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO windows_5s (
+            user_id, os_type, window_start,
+            keys, backspaces, corr_episodes,
+            n_iki, sum_iki, sumsq_iki, micro_pauses,
+            kb_active,
+            path_px, disp_px, gesture_s, gestures,
+            dir_changes, clicks,
+            created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
-        (
-            payload.user_id,
-            payload.os_type.lower(),
-            block_time,
-            active_mins,
-            avg_kpm,
-            avg_err,
-            avg_mouse_spd,
-            avg_straight,
-            datetime.now(timezone.utc).isoformat(),
-        ),
+        rows,
     )
     conn.commit()
+    inserted = conn.total_changes - before
     conn.close()
-
-    export_live_csv()
-    return {"status": "success"}
+    return {"status": "success", "received": len(rows), "inserted": inserted}
 
 # ==========================================
 # INGESTÃO DE WEARABLES
@@ -311,7 +276,6 @@ def save_bio(user_id, date_str, brand, rhr, hrv, total_s, deep_s, rem_s, rec):
     )
     conn.commit()
     conn.close()
-    export_live_csv()
 
 @app.post("/api/biometrics/apple-watch")
 def ingest_aw(p: AppleWatchPayload, _: None = Depends(verify_token)):
@@ -364,8 +328,9 @@ def ingest_label(p: GroundTruthPlaceholder, _: None = Depends(verify_token)):
     conn.close()
     return {"status": "success"}
 
+
 # ==========================================
-# DASHBOARD: LISTA DE UTILIZADORES & LIVE STATUS
+# DASHBOARD & DOWNLOADS
 # ==========================================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_status(token: Optional[str] = None):
@@ -374,7 +339,7 @@ def dashboard_status(token: Optional[str] = None):
 
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT user_id FROM telemetry_15m UNION SELECT DISTINCT user_id FROM daily_biometrics")
+    cursor.execute("SELECT DISTINCT user_id FROM windows_5s UNION SELECT DISTINCT user_id FROM daily_biometrics")
     all_users = [r[0] for r in cursor.fetchall() if r[0]]
 
     now_utc = datetime.now(timezone.utc)
@@ -382,13 +347,11 @@ def dashboard_status(token: Optional[str] = None):
 
     for u in all_users:
         cursor.execute(
-            "SELECT timestamp_block, os_type, count(id) FROM telemetry_15m WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (u,),
+            "SELECT MAX(window_start), MAX(os_type), COUNT(*) FROM windows_5s WHERE user_id = ?", (u,)
         )
-        t_row = cursor.fetchone()
-        last_t = t_row[0] if t_row else None
-        os_type = t_row[1].upper() if (t_row and t_row[1]) else "--"
-        total_blocks = t_row[2] if t_row else 0
+        last_t, os_raw, n_windows = cursor.fetchone()
+        os_type = os_raw.upper() if os_raw else "--"
+        active_min = round((n_windows or 0) * 5 / 60.0, 1)
 
         cursor.execute(
             "SELECT recorded_date, device_brand, recovery_score, hrv_rmssd_ms FROM daily_biometrics WHERE user_id = ? ORDER BY recorded_date DESC LIMIT 1",
@@ -405,7 +368,7 @@ def dashboard_status(token: Optional[str] = None):
                 diff_min = (now_utc - dt_last).total_seconds() / 60.0
                 dt_last_local = dt_last.astimezone(LISBON_TZ)
                 last_seen = f"há {int(diff_min)}m" if diff_min < 120 else dt_last_local.strftime("%d/%m %H:%M")
-                if diff_min <= 16:
+                if diff_min <= 3:
                     status_html = '<span style="color:#10b981; font-weight:bold;">● A Receber Dados (Online)</span>'
                 elif diff_min <= 60:
                     status_html = '<span style="color:#f59e0b; font-weight:bold;">● Ausente (Pausa Recente)</span>'
@@ -414,12 +377,12 @@ def dashboard_status(token: Optional[str] = None):
 
         user_rows.append(f"""
             <tr style="border-bottom: 1px solid #1e293b;">
-                <td style="padding: 12px 16px; font-weight: 600; color: #38bdf8;">{u}</td>
-                <td style="padding: 12px 16px;"><span style="background: #1e293b; padding: 2px 6px; border-radius: 4px; font-size: 11px;">{os_type}</span></td>
+                <td style="padding: 12px 16px; font-weight: 600; color: #38bdf8;">{html.escape(u)}</td>
+                <td style="padding: 12px 16px;"><span style="background: #1e293b; padding: 2px 6px; border-radius: 4px; font-size: 11px;">{html.escape(os_type)}</span></td>
                 <td style="padding: 12px 16px;">{status_html}</td>
                 <td style="padding: 12px 16px; color: #94a3b8;">{last_seen}</td>
-                <td style="padding: 12px 16px;">{total_blocks} blocos (15m)</td>
-                <td style="padding: 12px 16px; font-size: 12px; color: #94a3b8;">{bio_info}</td>
+                <td style="padding: 12px 16px;">{active_min} min ativos</td>
+                <td style="padding: 12px 16px; font-size: 12px; color: #94a3b8;">{html.escape(bio_info)}</td>
             </tr>
         """)
     conn.close()
@@ -449,8 +412,8 @@ def dashboard_status(token: Optional[str] = None):
                     <p style="color: #94a3b8; font-size: 13px; margin: 4px 0 0 0;">Feed de Telemetria e Conexão de Participantes</p>
                 </div>
                 <div>
-                    <a href="/api/dataset/download-csv?token={token}" class="btn">⬇ CSV</a>
-                    <a href="/api/dataset/download-xlsx?token={token}" class="btn">⬇ XLSX</a>
+                    <a href="/api/dataset/download-csv?token={html.escape(token)}" class="btn">⬇ CSV</a>
+                    <a href="/api/dataset/download-xlsx?token={html.escape(token)}" class="btn">⬇ XLSX</a>
                 </div>
             </div>
             <table>
@@ -470,9 +433,14 @@ def dashboard_status(token: Optional[str] = None):
 def download_live_csv(token: Optional[str] = None):
     if token != SECRET_API_TOKEN:
         raise HTTPException(status_code=401, detail="Token inválido.")
-    if os.path.exists(CSV_FILE):
-        return FileResponse(CSV_FILE, media_type="text/csv", filename="mindsync_live.csv")
-    return {"status": "empty", "message": "Ficheiro CSV ainda não criado."}
+    conn = get_conn()
+    df = build_dataset(conn)
+    conn.close()
+    return Response(
+        content=df.to_csv(index=False),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="mindsync_live.csv"'},
+    )
 
 @app.get("/api/dataset/download-xlsx")
 def download_xlsx(token: Optional[str] = None):
@@ -480,18 +448,17 @@ def download_xlsx(token: Optional[str] = None):
         raise HTTPException(status_code=401, detail="Token inválido.")
 
     conn = get_conn()
-    t_df = pd.read_sql_query("SELECT * FROM telemetry_15m", conn)
-    b_df = pd.read_sql_query("SELECT * FROM daily_biometrics", conn)
-    l_df = pd.read_sql_query("SELECT * FROM ground_truth_labels", conn)
+    blocks = build_dataset(conn)
+    windows = pd.read_sql_query("SELECT * FROM windows_5s", conn)
+    bio = pd.read_sql_query("SELECT * FROM daily_biometrics", conn)
+    labels = pd.read_sql_query("SELECT * FROM ground_truth_labels", conn)
     conn.close()
 
-    # Gerado on-demand (não a cada POST) para não penalisar a ingestão.
-    # Inclui as 3 tabelas em folhas separadas — para ML normalmente vais querer
-    # trabalhar a partir destas tabelas "cruas" (ou do CSV já unido), não só o XLSX.
     with pd.ExcelWriter(XLSX_FILE, engine="openpyxl") as writer:
-        t_df.to_excel(writer, sheet_name="telemetry_15m", index=False)
-        b_df.to_excel(writer, sheet_name="daily_biometrics", index=False)
-        l_df.to_excel(writer, sheet_name="ground_truth_labels", index=False)
+        blocks.to_excel(writer, sheet_name="blocks_15m", index=False)
+        windows.to_excel(writer, sheet_name="windows_5s", index=False)
+        bio.to_excel(writer, sheet_name="daily_biometrics", index=False)
+        labels.to_excel(writer, sheet_name="ground_truth_labels", index=False)
 
     return FileResponse(
         XLSX_FILE,

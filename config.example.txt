@@ -1,0 +1,5 @@
+# Copia para config.txt (ignorado pelo git) e preenche
+USER_ID=muda_isto
+API_URL=http://localhost:8000/api/telemetry
+API_TOKEN=
+RAW_LOG=1
