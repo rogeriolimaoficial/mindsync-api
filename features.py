@@ -15,7 +15,7 @@ SUM_COLS = [
 ]
 
 BLOCK_COLS = [
-    "user_id", "os_type", "timestamp_block", "local_date",
+    "user_id", "os_type", "timestamp_block", "local_date", "local_time", "local_min",
     "active_s", "kb_active_s", "active_pct", "reliable",
     "typing_kpm", "backspace_ratio_pct", "corr_eps_per_min", "pauses_per_min",
     "iki_mean_ms", "iki_std_ms",
@@ -61,5 +61,8 @@ def build_blocks(conn, tz="Europe/Lisbon") -> pd.DataFrame:
     g["dir_changes_per_1000px"] = 1000 * g["dir_changes"] / path
 
     g["timestamp_block"] = g["block"].dt.strftime("%Y-%m-%d %H:%M:00")
-    g["local_date"] = g["block"].dt.tz_convert(tz).dt.strftime("%Y-%m-%d")
+    loc = g["block"].dt.tz_convert(tz)
+    g["local_date"] = loc.dt.strftime("%Y-%m-%d")
+    g["local_time"] = loc.dt.strftime("%H:%M")
+    g["local_min"] = loc.dt.hour * 60 + loc.dt.minute
     return g[BLOCK_COLS].sort_values(["user_id", "timestamp_block"]).reset_index(drop=True)

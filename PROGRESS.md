@@ -6,7 +6,8 @@ Atualizar quando fechares algo relevante. Quem abre um chat novo cola este fiche
 - Tracker com janelas de 5s e features novas (episódios de correção, intervalos, pausas, rato): reescrito, testado com dados simulados, falta testar no PC
 - Servidor guarda janelas de 5s e agrega a 15 min em `features.py`: feito, testado com dados simulados
 - Wearables (Apple Watch, Whoop, Garmin, Amazfit) e Oura (sono): endpoints e scripts existentes, por validar com dados reais
-- Check-in de energia: tabela e endpoint existem, falta definir as perguntas e a interface
+- Check-in de energia e foco (1 a 5): página `/checkin` feita, falta usar durante 1 semana
+- Gráficos `/explore`: feitos, falta ver com dados reais
 
 ## Decisões
 - Biometria só do sono no MVP, previsão do pico (não adaptativa)
@@ -18,8 +19,8 @@ Atualizar quando fechares algo relevante. Quem abre um chat novo cola este fiche
 ## Próximos passos
 - [ ] Rodar segredos da Oura e do token da API, limpar o histórico do repo
 - [ ] Testar o tracker no PC e correr 1 semana
-- [ ] Definir as perguntas do check-in (energia/foco 1 a 5) e fazer a interface
-- [ ] Gráfico: barras de velocidade + painéis de pausas e correções
+- [ ] Pôr o `/checkin` no ecrã inicial do telemóvel e responder a cada 60 a 90 min
+- [ ] Ligar o Apple Watch (sono, HRV, FC em repouso) ao endpoint `/api/biometrics/apple-watch`
 - [ ] Decidir normalização por utilizador (baseline rolante)
 
 ## Em aberto

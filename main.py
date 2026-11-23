@@ -1,5 +1,7 @@
 import html
+import json
 import logging
+import secrets
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from features import build_blocks
+from pages import CHECKIN_HTML, EXPLORE_HTML
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mindsync")
@@ -105,9 +108,10 @@ class GroundTruthPlaceholder(BaseModel):
     # Quando decidires as perguntas finais, troca slot_1/slot_2 por campos nomeados.
     user_id: str
     timestamp: Optional[str] = None
-    slot_1: Optional[int] = None
-    slot_2: Optional[int] = None
-    notes: Optional[str] = None
+    # slot_1 = energia (1 a 5), slot_2 = foco (1 a 5)
+    slot_1: Optional[int] = Field(default=None, ge=1, le=5)
+    slot_2: Optional[int] = Field(default=None, ge=1, le=5)
+    notes: Optional[str] = Field(default=None, max_length=300)
 
 
 # ==========================================
@@ -412,6 +416,8 @@ def dashboard_status(token: Optional[str] = None):
                     <p style="color: #94a3b8; font-size: 13px; margin: 4px 0 0 0;">Feed de Telemetria e Conexão de Participantes</p>
                 </div>
                 <div>
+                    <a href="/explore?token={html.escape(token)}" class="btn">Gráficos</a>
+                    <a href="/checkin?token={html.escape(token)}" class="btn">Check-in</a>
                     <a href="/api/dataset/download-csv?token={html.escape(token)}" class="btn">⬇ CSV</a>
                     <a href="/api/dataset/download-xlsx?token={html.escape(token)}" class="btn">⬇ XLSX</a>
                 </div>
@@ -465,6 +471,77 @@ def download_xlsx(token: Optional[str] = None):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename="mindsync_dataset.xlsx",
     )
+
+# ==========================================
+# GRÁFICOS (/explore) E CHECK-IN (/checkin)
+# ==========================================
+def _check_token(token: Optional[str]):
+    if not token or not secrets.compare_digest(token, SECRET_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Token inválido. Usa ?token=O_TEU_TOKEN")
+
+def _labels_local(conn, user_id: Optional[str] = None) -> pd.DataFrame:
+    q, params = "SELECT * FROM ground_truth_labels", ()
+    if user_id:
+        q, params = q + " WHERE user_id = ?", (user_id,)
+    df = pd.read_sql_query(q, conn, params=params)
+    if df.empty:
+        return df.assign(local_date=[], local_min=[], local_time=[])
+    df["ts"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce", format="ISO8601")
+    df = df.dropna(subset=["ts"]).copy()
+    loc = df["ts"].dt.tz_convert(LISBON_TZ)
+    df["local_date"] = loc.dt.strftime("%Y-%m-%d")
+    df["local_min"] = loc.dt.hour * 60 + loc.dt.minute
+    df["local_time"] = loc.dt.strftime("%H:%M")
+    return df
+
+def _records(df: pd.DataFrame) -> list:
+    return json.loads(df.to_json(orient="records"))
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+@app.get("/explore", response_class=HTMLResponse)
+def explore_page(token: Optional[str] = None):
+    _check_token(token)
+    return EXPLORE_HTML
+
+@app.get("/checkin", response_class=HTMLResponse)
+def checkin_page(token: Optional[str] = None):
+    _check_token(token)
+    return CHECKIN_HTML
+
+@app.get("/api/explore/meta")
+def explore_meta(token: Optional[str] = None):
+    _check_token(token)
+    conn = get_conn()
+    blocks = build_blocks(conn)
+    labels = _labels_local(conn)
+    conn.close()
+    users: dict = {}
+    for u, d in blocks[["user_id", "local_date"]].drop_duplicates().itertuples(index=False):
+        users.setdefault(u, set()).add(d)
+    for u, d in labels[["user_id", "local_date"]].drop_duplicates().itertuples(index=False):
+        users.setdefault(u, set()).add(d)
+    return {"users": [{"user_id": u, "dates": sorted(ds, reverse=True)} for u, ds in sorted(users.items())]}
+
+@app.get("/api/explore/day")
+def explore_day(user_id: str, date: str, token: Optional[str] = None):
+    _check_token(token)
+    conn = get_conn()
+    blocks = build_blocks(conn)
+    blocks = blocks[(blocks["user_id"] == user_id) & (blocks["local_date"] == date)]
+    labels = _labels_local(conn, user_id)
+    labels = labels[labels["local_date"] == date].sort_values("local_min")
+    bio = pd.read_sql_query(
+        "SELECT * FROM daily_biometrics WHERE user_id = ? AND recorded_date = ?", conn, params=(user_id, date)
+    )
+    conn.close()
+    return {
+        "blocks": _records(blocks.sort_values("local_min")),
+        "labels": _records(labels[["local_min", "local_time", "slot_1", "slot_2", "notes"]]),
+        "bio": _records(bio)[0] if not bio.empty else None,
+    }
 
 @app.get("/")
 def health():

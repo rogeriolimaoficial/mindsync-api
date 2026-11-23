@@ -8,6 +8,7 @@ Recolhe sinais de comportamento no PC e, com labels de energia, treina um modelo
 | `tracker.py` | corre no PC do utilizador, envia janelas de 5s |
 | `main.py` | servidor FastAPI (ingestão, wearables, labels, dashboard, downloads) |
 | `features.py` | agrega janelas de 5s em blocos de 15 min |
+| `pages.py` | páginas `/explore` (gráficos) e `/checkin` (energia e foco) |
 | `view_data.py` | imprime os blocos de um utilizador/dia |
 | `auth.py`, `server.py`, `get_token.py`, `get_sleep_data.py` | autorização e leitura de sono da Oura |
 
@@ -26,6 +27,11 @@ Tracker: copia `config.example.txt` para `config.txt`, preenche `USER_ID` e `API
 **Servidor:** guarda as janelas em `windows_5s` (sem duplicados). Os blocos de 15 min são calculados em `features.py` somando os totais e dividindo no fim.
 
 **Features por bloco:** `typing_kpm`, `backspace_ratio_pct`, `corr_eps_per_min`, `pauses_per_min`, `iki_mean_ms`, `iki_std_ms`, `mouse_speed_px_s`, `straightness_pct`, `dir_changes_per_1000px`, `active_pct`. `reliable=0` quando há menos de 2 min de escrita ativa.
+
+## Páginas (precisam de `?token=O_TOKEN`)
+- `/dashboard`: estado da ligação de cada utilizador
+- `/explore`: gráficos por dia (velocidade, pausas e correções, rato, check-ins, sono) e tabela de blocos
+- `/checkin`: dois toques (energia 1 a 5, foco 1 a 5). Guarda no telemóvel como favorito ou no ecrã inicial. Grava em `ground_truth_labels` (`slot_1` = energia, `slot_2` = foco)
 
 ## Plano
 1. Uso próprio durante 1 semana: a curva do dia é estável de dia para dia?
